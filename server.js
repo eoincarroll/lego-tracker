@@ -1,17 +1,24 @@
 const express = require('express');
 const axios = require('axios');
 const { Firestore } = require('@google-cloud/firestore');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
+
+// Serve static frontend files from the "public" directory
+app.use(express.static('public'));
 
 const db = new Firestore();
 const PORT = process.env.PORT || 8080;
 const REBRICKABLE_API_KEY = process.env.REBRICKABLE_API_KEY;
 
-// Health Check Endpoint
+/**
+ * GET /
+ * Serves the primary web interface
+ */
 app.get('/', (req, res) => {
-  res.send('LEGO Tracker Service is active.');
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 /**
