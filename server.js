@@ -3,12 +3,11 @@ const axios = require('axios');
 const path = require('path');
 const admin = require('firebase-admin');
 
-// 1. Initialize Firebase Admin SDK (Shares your existing Firestore database)
+// Initialize Firebase Admin SDK using Application Default Credentials
 admin.initializeApp({
-  projectId: process.env.GOOGLE_CLOUD_PROJECT || '65744691245',
+  projectId: process.env.GOOGLE_CLOUD_PROJECT || 'lego-tracker-65744691245',
 });
 
-// Use the Firestore instance from Firebase Admin
 const db = admin.firestore();
 
 const app = express();
@@ -23,9 +22,9 @@ const REBRICKABLE_API_KEY = process.env.REBRICKABLE_API_KEY;
  */
 app.get('/api/config/firebase', (req, res) => {
   res.json({
-    apiKey: 'AIzaSyDXmqC9k0a8WkFwiDv9YcYWUBm2AU1PSE0',
-    authDomain: 'lego-tracker-65744691245.firebaseapp.com',
-    projectId: 'lego-tracker-65744691245',
+    apiKey: process.env.FIREBASE_WEB_API_KEY || '',
+    authDomain: `${process.env.GOOGLE_CLOUD_PROJECT || 'lego-tracker-65744691245'}.firebaseapp.com`,
+    projectId: process.env.GOOGLE_CLOUD_PROJECT || 'lego-tracker-65744691245',
   });
 });
 
@@ -42,7 +41,7 @@ const authenticateUser = async (req, res, next) => {
   const idToken = authHeader.split('Bearer ')[1];
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedToken; // Contains req.user.uid and req.user.email
+    req.user = decodedToken;
     next();
   } catch (error) {
     console.error('Token verification error:', error.message);
@@ -86,7 +85,6 @@ app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async 
     const { setNum } = req.params;
     const { format = 'json' } = req.query;
 
-    // 1. Fetch missing parts tracked under this set document in Firestore
     const snapshot = await db
       .collection('sets')
       .doc(setNum)
@@ -100,7 +98,6 @@ app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async 
 
     const missingParts = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 
-    // 2. Resolve missing Element IDs via Rebrickable API
     const formattedItems = await Promise.all(
       missingParts.map(async (item) => {
         let elementId = item.element_id;
@@ -137,7 +134,6 @@ app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async 
 
     const validItems = formattedItems.filter((i) => i.elementId !== 'UNKNOWN');
 
-    // 3. Output as Pick a Brick CSV or JSON
     if (format.toLowerCase() === 'csv') {
       let csvContent = 'Element ID,Quantity\n';
       validItems.forEach((item) => {
