@@ -1,205 +1,200 @@
 const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const admin = require('firebase-admin');
+const axios = require('axios');
+const { Firestore } = require('@google-cloud/firestore');
 const path = require('path');
+const admin = require('firebase-admin');
 
-// Initialize Firebase Admin SDK (inherits Cloud Run default service account credentials)
-if (!admin.apps.length) {
-    admin.initializeApp();
-}
-const db = admin.firestore();
+// Initialize Firebase Admin SDK using Application Default Credentials on Cloud Run
+admin.initializeApp();
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+app.use(express.json());
+app.use(express.static('public'));
 
-// Middleware Setup
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-
+const db = new Firestore();
 const PORT = process.env.PORT || 8080;
 const REBRICKABLE_API_KEY = process.env.REBRICKABLE_API_KEY;
 
 /**
- * Normalizes set numbers into standard Rebrickable format (e.g. "75212" -> "75212-1")
+ * Authentication Middleware
+ * Verifies the Google/Firebase ID Token sent in the Authorization header
  */
-function normalizeSetNum(input) {
-    if (!input) return '';
-    let cleaned = input.trim();
-    if (cleaned.includes('rebrickable.com')) {
-        const match = cleaned.match(/sets\/([^\/]+)/);
-        if (match) cleaned = match[1];
-    }
-    if (!cleaned.includes('-')) {
-        cleaned = `${cleaned}-1`;
-    }
-    return cleaned;
-}
+const authenticateUser = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: Missing or malformed token' });
+  }
 
-// -----------------------------------------------------------------------------
-// ENDPOINTS
-// -----------------------------------------------------------------------------
+  const idToken = authHeader.split('Bearer ')[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken; // Attach user info (uid, email) to request
+    next();
+  } catch (error) {
+    console.error('Token verification error:', error.message);
+    return res.status(403).json({ error: 'Unauthorized: Invalid token' });
+  }
+};
 
 /**
- * Fetch set metadata and full parts breakdown from Rebrickable
+ * GET /
+ * Serves the primary web interface
  */
-app.get('/api/set/:setNum', async (req, res) => {
-    const rawSetNum = req.params.setNum;
-    const setNum = normalizeSetNum(rawSetNum);
-
-    if (!REBRICKABLE_API_KEY) {
-        return res.status(500).json({ error: 'REBRICKABLE_API_KEY environment variable is not configured on Cloud Run.' });
-    }
-
-    try {
-        const headers = { 'Authorization': `key ${REBRICKABLE_API_KEY}` };
-
-        // Fetch set overview
-        const setRes = await fetch(`https://rebrickable.com/api/v3/lego/sets/${setNum}/`, { headers });
-        if (!setRes.ok) {
-            if (setRes.status === 404) return res.status(404).json({ error: `Set ${setNum} not found on Rebrickable.` });
-            throw new Error(`Rebrickable API error: ${setRes.statusText}`);
-        }
-        const setData = await setRes.json();
-
-        // Fetch parts listing across paginated results
-        let parts = [];
-        let nextPageUrl = `https://rebrickable.com/api/v3/lego/sets/${setNum}/parts/?page_size=1000`;
-
-        while (nextPageUrl) {
-            const partsRes = await fetch(nextPageUrl, { headers });
-            if (!partsRes.ok) throw new Error('Failed to fetch set parts from Rebrickable.');
-            const partsData = await partsRes.json();
-            
-            const formattedParts = partsData.results.map(item => ({
-                partNum: item.part.part_num,
-                name: item.part.name,
-                color: item.color.name,
-                colorId: item.color.id,
-                qtyRequired: item.quantity,
-                qtyHave: 0,
-                imageUrl: item.part.part_img_url || item.color.color_img_url || null,
-                elementId: item.element_id
-            }));
-
-            parts = parts.concat(formattedParts);
-            nextPageUrl = partsData.next;
-        }
-
-        const payload = {
-            setNum: setData.set_num,
-            name: setData.name,
-            year: setData.year,
-            themeId: setData.theme_id,
-            totalParts: setData.num_parts,
-            setImageUrl: setData.set_img_url,
-            parts: parts
-        };
-
-        res.json(payload);
-
-    } catch (err) {
-        console.error(`Error fetching set ${setNum}:`, err.message);
-        res.status(500).json({ error: err.message });
-    }
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 /**
- * Retrieve user's entire saved inventory from Firestore
+ * GET /api/sets
+ * Retrieves all sets belonging strictly to the logged-in user
  */
-app.get('/api/progress/:userId', async (req, res) => {
-    const userId = req.params.userId || 'default_user';
+app.get('/api/sets', authenticateUser, async (req, res) => {
+  try {
+    const snapshot = await db
+      .collection('sets')
+      .where('userId', '==', req.user.uid)
+      .get();
 
-    try {
-        const snapshot = await db.collection('users').doc(userId).collection('saved_sets').get();
-        if (snapshot.empty) {
-            return res.json({ userId, savedSets: {} });
-        }
-
-        const savedSets = {};
-        snapshot.forEach(doc => {
-            savedSets[doc.id] = doc.data().data;
-        });
-
-        res.json({ userId, savedSets });
-    } catch (err) {
-        console.error('Error fetching progress from Firestore:', err);
-        res.status(500).json({ error: 'Failed to retrieve saved progress' });
-    }
+    const sets = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    return res.status(200).json(sets);
+  } catch (error) {
+    console.error('Error fetching user sets:', error);
+    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
+  }
 });
 
 /**
- * Save single set state to Firestore
+ * GET /api/sets/:setNum/missing-parts/pick-a-brick
+ * Retrieves missing parts scoped to the authenticated user
  */
-app.post('/api/progress/save-set', async (req, res) => {
-    const { userId, setNum, setProgress } = req.body;
-    const targetUser = userId || 'default_user';
+app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async (req, res) => {
+  try {
+    const { setNum } = req.params;
+    const { format = 'json' } = req.query;
 
-    if (!setNum || !setProgress) {
-        return res.status(400).json({ error: 'Missing setNum or setProgress in payload' });
+    // Verify set ownership
+    const setDoc = await db.collection('sets').doc(setNum).get();
+    if (!setDoc.exists || setDoc.data().userId !== req.user.uid) {
+      return res.status(404).json({ error: 'Set not found or unauthorized' });
     }
 
-    try {
-        const docRef = db.collection('users').doc(targetUser).collection('saved_sets').doc(setNum);
-        
-        await docRef.set({
-            data: setProgress,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+    // 1. Fetch missing parts tracked under this set
+    const snapshot = await db
+      .collection('sets')
+      .doc(setNum)
+      .collection('missing_parts')
+      .where('quantity', '>', 0)
+      .get();
 
-        res.json({ message: `Progress saved successfully for set ${setNum}` });
-    } catch (err) {
-        console.error('Error saving set progress:', err);
-        res.status(500).json({ error: 'Failed to save set progress to Firestore' });
-    }
-});
-
-/**
- * Backup upload endpoint to import local JSON data directly into Firestore
- */
-app.post('/api/progress/upload-json', upload.single('backupFile'), async (req, res) => {
-    const userId = req.body.userId || 'default_user';
-
-    if (!req.file) {
-        return res.status(400).json({ error: 'No JSON backup file uploaded' });
+    if (snapshot.empty) {
+      return res.status(200).json({ message: 'No missing parts found for this set.', items: [] });
     }
 
-    try {
-        const fileContent = req.file.buffer.toString('utf-8');
-        const parsedData = JSON.parse(fileContent);
+    const missingParts = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 
-        const batch = db.batch();
-        const userRef = db.collection('users').doc(userId).collection('saved_sets');
+    // 2. Resolve missing Element IDs via Rebrickable API
+    const formattedItems = await Promise.all(
+      missingParts.map(async (item) => {
+        let elementId = item.element_id;
 
-        const setsToImport = parsedData.savedSets || parsedData;
+        if (!elementId && item.part_num && item.color_id) {
+          try {
+            const rbRes = await axios.get(
+              `https://rebrickable.com/api/v3/lego/sets/${setNum}/parts/`,
+              {
+                headers: { Authorization: `key ${REBRICKABLE_API_KEY}` },
+                params: { page_size: 1000 },
+              }
+            );
 
-        let count = 0;
-        for (const [setNum, setData] of Object.entries(setsToImport)) {
-            if (typeof setData === 'object' && setData !== null) {
-                const docRef = userRef.doc(setNum);
-                batch.set(docRef, {
-                    data: setData,
-                    importedAt: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-                count++;
+            const match = rbRes.data.results.find(
+              (p) => p.part.part_num === item.part_num && p.color.id === item.color_id
+            );
+
+            if (match && match.element_id) {
+              elementId = match.element_id;
             }
+          } catch (err) {
+            console.warn(`Failed to fetch element_id for ${item.part_num}:`, err.message);
+          }
         }
 
-        await batch.commit();
+        return {
+          elementId: elementId || 'UNKNOWN',
+          quantity: item.quantity,
+          partNum: item.part_num || null,
+        };
+      })
+    );
 
-        res.json({ message: `Successfully imported ${count} set(s) into Firestore.` });
-    } catch (err) {
-        console.error('Error processing JSON file upload:', err);
-        res.status(500).json({ error: `Invalid JSON format or database error: ${err.message}` });
+    const validItems = formattedItems.filter((i) => i.elementId !== 'UNKNOWN');
+
+    // 3. Output as Pick a Brick CSV or JSON
+    if (format.toLowerCase() === 'csv') {
+      let csvContent = 'Element ID,Quantity\n';
+      validItems.forEach((item) => {
+        csvContent += `${item.elementId},${item.quantity}\n`;
+      });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${setNum}-missing-parts.csv"`);
+      return res.status(200).send(csvContent);
     }
+
+    return res.status(200).json({
+      set_num: setNum,
+      total_missing_elements: validItems.length,
+      pick_a_brick_payload: validItems.map((item) => ({
+        element_id: item.elementId,
+        quantity: item.quantity,
+      })),
+      unresolved_items: formattedItems.filter((i) => i.elementId === 'UNKNOWN'),
+    });
+  } catch (error) {
+    console.error('Error fetching missing parts:', error);
+    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
+  }
 });
 
-// Single Page App fallback
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+/**
+ * POST /api/admin/claim-legacy-data
+ * ONE-TIME MIGRATION: Claims all existing root-level sets for the currently logged-in user
+ */
+app.post('/api/admin/claim-legacy-data', authenticateUser, async (req, res) => {
+  try {
+    const userUid = req.user.uid;
+    const setsRef = db.collection('sets');
+    const snapshot = await setsRef.get();
+
+    if (snapshot.empty) {
+      return res.status(200).json({ message: 'No legacy sets found to claim.' });
+    }
+
+    const batch = db.batch();
+    let claimedCount = 0;
+
+    snapshot.docs.forEach((doc) => {
+      const data = doc.data();
+      // Only claim documents that don't already have an assigned userId
+      if (!data.userId) {
+        batch.update(doc.ref, { userId: userUid });
+        claimedCount++;
+      }
+    });
+
+    if (claimedCount > 0) {
+      await batch.commit();
+    }
+
+    return res.status(200).json({
+      message: `Successfully assigned ${claimedCount} legacy set(s) to user ID: ${userUid}`,
+    });
+  } catch (error) {
+    console.error('Error claiming legacy data:', error);
+    return res.status(500).json({ error: 'Failed to claim data', details: error.message });
+  }
 });
 
 app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+  console.log(`LEGO Tracker running on port ${PORT}`);
 });
