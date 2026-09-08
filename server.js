@@ -1,23 +1,37 @@
 const express = require('express');
 const axios = require('axios');
-const { Firestore } = require('@google-cloud/firestore');
 const path = require('path');
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin SDK using Application Default Credentials on Cloud Run
-admin.initializeApp();
+// 1. Initialize Firebase Admin SDK (Shares your existing Firestore database)
+admin.initializeApp({
+  projectId: process.env.GOOGLE_CLOUD_PROJECT || '65744691245',
+});
+
+// Use the Firestore instance from Firebase Admin
+const db = admin.firestore();
 
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-const db = new Firestore();
 const PORT = process.env.PORT || 8080;
 const REBRICKABLE_API_KEY = process.env.REBRICKABLE_API_KEY;
 
 /**
+ * Endpoint to serve Firebase web config dynamically to the frontend
+ */
+app.get('/api/config/firebase', (req, res) => {
+  res.json({
+    apiKey: process.env.FIREBASE_WEB_API_KEY || '',
+    authDomain: `${process.env.GOOGLE_CLOUD_PROJECT || '65744691245'}.firebaseapp.com`,
+    projectId: process.env.GOOGLE_CLOUD_PROJECT || '65744691245',
+  });
+});
+
+/**
  * Authentication Middleware
- * Verifies the Google/Firebase ID Token sent in the Authorization header
+ * Verifies the Google ID Token sent from index.html
  */
 const authenticateUser = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -28,7 +42,7 @@ const authenticateUser = async (req, res, next) => {
   const idToken = authHeader.split('Bearer ')[1];
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    req.user = decodedToken; // Attach user info (uid, email) to request
+    req.user = decodedToken; // Contains req.user.uid and req.user.email
     next();
   } catch (error) {
     console.error('Token verification error:', error.message);
@@ -46,7 +60,7 @@ app.get('/', (req, res) => {
 
 /**
  * GET /api/sets
- * Retrieves all sets belonging strictly to the logged-in user
+ * Retrieves all sets belonging to the logged-in user
  */
 app.get('/api/sets', authenticateUser, async (req, res) => {
   try {
@@ -72,13 +86,7 @@ app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async 
     const { setNum } = req.params;
     const { format = 'json' } = req.query;
 
-    // Verify set ownership
-    const setDoc = await db.collection('sets').doc(setNum).get();
-    if (!setDoc.exists || setDoc.data().userId !== req.user.uid) {
-      return res.status(404).json({ error: 'Set not found or unauthorized' });
-    }
-
-    // 1. Fetch missing parts tracked under this set
+    // 1. Fetch missing parts tracked under this set document in Firestore
     const snapshot = await db
       .collection('sets')
       .doc(setNum)
@@ -158,7 +166,7 @@ app.get('/api/sets/:setNum/missing-parts/pick-a-brick', authenticateUser, async 
 
 /**
  * POST /api/admin/claim-legacy-data
- * ONE-TIME MIGRATION: Claims all existing root-level sets for the currently logged-in user
+ * ONE-TIME MIGRATION: Claims all existing root-level sets for your logged-in Google UID
  */
 app.post('/api/admin/claim-legacy-data', authenticateUser, async (req, res) => {
   try {
@@ -175,7 +183,6 @@ app.post('/api/admin/claim-legacy-data', authenticateUser, async (req, res) => {
 
     snapshot.docs.forEach((doc) => {
       const data = doc.data();
-      // Only claim documents that don't already have an assigned userId
       if (!data.userId) {
         batch.update(doc.ref, { userId: userUid });
         claimedCount++;
