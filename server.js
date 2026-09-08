@@ -23,9 +23,9 @@ const REBRICKABLE_API_KEY = process.env.REBRICKABLE_API_KEY;
  */
 app.get('/api/config/firebase', (req, res) => {
   res.json({
-    apiKey: process.env.FIREBASE_WEB_API_KEY || 'AIzaSyDXmqC9k0a8WkFwiDv9YcYWUBm2AU1PSE0',
-    authDomain: `${process.env.GOOGLE_CLOUD_PROJECT || '65744691245'}.firebaseapp.com`,
-    projectId: process.env.GOOGLE_CLOUD_PROJECT || '65744691245',
+    apiKey: 'AIzaSyDXmqC9k0a8WkFwiDv9YcYWUBm2AU1PSE0',
+    authDomain: 'lego-tracker-65744691245.firebaseapp.com',
+    projectId: 'lego-tracker-65744691245',
   });
 });
 
